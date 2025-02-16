@@ -1,0 +1,232 @@
+---
+title: "Gourmet Haven Preprocessing and XGBoost Model"
+author: "Goodness Rex Nze-Igwe"
+date: "2025-01-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+```{r, warning=FALSE, message=FALSE}
+library(caret)
+library(tidyverse)
+library(skimr)
+library(lubridate)
+library(GGally)
+library(ROCR)
+library(xgboost)
+library(SHAPforxgboost)
+```
+
+
+```{r, warning=FALSE}
+#load dataset
+gourmet_data <- read.csv(file.choose(),header = T)
+holdout_data <- read.csv(file.choose(),header = T)
+head(gourmet_data)
+```
+
+# Step 0: Exploratory Data analysis, check data consistency etc.
+```{r, warning=FALSE}
+# structure - see variable type
+summaryStats <- skim(gourmet_data)
+summaryStats
+```
+
+
+```{r, warning=FALSE}
+summary(gourmet_data)
+```
+
+Convert character variables and response to factors. 
+```{r, warning=FALSE}
+gourmet_data<-gourmet_data%>% mutate_at(c("Response","Education", "Marital_Status"), as.factor) 
+
+holdout_data<-holdout_data%>% mutate_at(c("Education", "Marital_Status"), as.factor) 
+
+
+# rename response 
+gourmet_data$Response <-fct_recode(gourmet_data$Response, Response = "1",NoResponse = "0")
+
+# relevel response
+gourmet_data$Response<- relevel(gourmet_data$Response, ref = "Response")
+
+#make sure levels are correct
+levels(gourmet_data$Response)
+```
+
+Check for duplicate observations
+```{r, warning=FALSE}
+duplicates <- duplicated(gourmet_data)
+sum_duplicate <- sum(duplicates)
+sum_duplicate
+```
+
+```{r, warning=FALSE}
+#remove duplicate rows from data frame
+gourmet_data<-gourmet_data %>%distinct(.keep_all = TRUE)
+holdout_data<-holdout_data %>%distinct(.keep_all = TRUE)
+
+```
+
+
+Change dt_customer to date format
+```{r, warning=FALSE}
+gourmet_data$Dt_Customer <- as.Date(gourmet_data$Dt_Customer, format = "%m/%d/%Y")
+holdout_data$Dt_Customer <- as.Date(holdout_data$Dt_Customer, format = "%m/%d/%Y")
+str(gourmet_data$Dt_Customer)
+```
+check for NA values
+```{r, warning=FALSE}
+colSums(is.na(gourmet_data))
+
+colSums(is.na(holdout_data))
+
+
+```
+Income column has 15 NA values, imputing the NA values in the column with mean.
+```{r, warning=FALSE}
+gourmet_data$Income[is.na(gourmet_data$Income)] <- mean(gourmet_data$Income, na.rm = TRUE)
+
+holdout_data$Income[is.na(holdout_data$Income)] <- mean(holdout_data$Income, na.rm = TRUE)
+colSums(is.na(holdout_data))
+```
+
+Checking and Removing outliers in Income column
+
+```{r, warning=FALSE}
+remove_outliers <- function(x) {
+  Q1 <- quantile(x,0.25,na.rm = TRUE)
+  Q3 <- quantile(x,0.75,na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  x >= lower_bound & x<= upper_bound
+}
+
+gourmet_data <- gourmet_data %>%
+  filter(remove_outliers(Income))
+
+holdout_data <- holdout_data %>%
+  filter(remove_outliers(Income))
+summary(gourmet_data)
+```
+
+Creating dummy variables using model.matrix
+
+```{r, warning=FALSE}
+gourmet_data_dummy <- model.matrix(Response~ ., data = gourmet_data)
+gourmet_data_dummy <- data.frame(gourmet_data_dummy[,-1])
+gourmet_data <- cbind(Response = gourmet_data$Response, gourmet_data_dummy)
+head(gourmet_data)
+
+holdout_data_dummy <- model.matrix(~., data = holdout_data)
+holdout_data <- data.frame(holdout_data_dummy[,-1])
+```
+
+
+Splitting the data into train and test datasets
+
+
+```{r, warning=FALSE}
+set.seed(99)
+index <-createDataPartition(gourmet_data$Response, p = .8,list = FALSE)
+gourmet_data_train <- gourmet_data[index,]
+gourmet_data_test <- gourmet_data[-index,]
+```
+
+
+XGBoost Model
+
+```{r, warning=FALSE}
+set.seed(8)
+model_gbm <- train(Response ~ .,
+                   data = gourmet_data_train,
+                   method = "xgbTree",
+                   trControl =trainControl(method = "cv", 
+                                           number = 5,
+                                           classProbs = TRUE,
+                                           summaryFunction = twoClassSummary),
+                   # provide a grid of parameters
+                   tuneGrid = expand.grid(
+                     nrounds = c(50,200),
+                     eta = c(0.025, 0.05),
+                     max_depth = c(2, 3),
+                     gamma = 0,
+                     colsample_bytree = 1,
+                     min_child_weight = 1,
+                     subsample = 1),
+                   verbose=FALSE,
+                   metric="ROC")
+plot(model_gbm)
+
+model_gbm$bestTune
+
+plot(varImp(model_gbm))
+
+
+Xdata <- as.matrix(select(gourmet_data_train,
+                          -Response))
+
+shap<- shap.prep(model_gbm$finalModel, X_train = Xdata)
+
+
+shap.plot.summary(shap)
+
+shap.plot.dependence(shap,
+                     x="Recency",
+                     color_feature = "rm",
+                     smooth = FALSE,
+                     jitter_width = 0.01,
+                     alpha = 0.4)
+
+
+
+
+top4<-shap.importance(shap, names_only = TRUE)[1:4]
+
+for (x in top4) {
+  p <- shap.plot.dependence(
+    shap, 
+    x = x, 
+    color_feature = "auto", 
+    smooth = FALSE, 
+    jitter_width = 0.01, 
+    alpha = 0.4
+  ) +
+    ggtitle(x)
+  print(p)
+}
+
+# Step 3: Get Predictions using Testing Set Data
+bc_prob<- predict(model_gbm, gourmet_data_test, type = "prob")
+
+holdout_data$Marital_StatusAlone <-0
+
+
+bc_prob_holdout<- predict(model_gbm, holdout_data, type = "prob")
+
+case_holdout_scored<- cbind(holdout_data, bc_prob_holdout$Response)
+
+
+write.csv(case_holdout_scored, "Holdout_Scored.csv", row.names = FALSE)
+
+
+
+pred_xgboost <- prediction(bc_prob$Response,gourmet_data_test$Response,label.ordering=c("NoResponse","Response") )
+
+perf_xgboost <- performance(pred_xgboost, "tpr", "fpr")
+
+plot(perf_xgboost, colorize=TRUE)
+
+
+auc_xgboost<-unlist(slot(performance(pred_xgboost, "auc"), "y.values"))
+
+auc_xgboost
+
+
+```
+
